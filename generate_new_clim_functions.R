@@ -224,7 +224,6 @@ calculate_sipnet_vpd <- function(Tair_C,
   )
 }
 
-
 .sipnet_tau_log <- function(level, ...) {
   if (requireNamespace("PEcAn.logger", quietly = TRUE)) {
     logger <- getExportedValue("PEcAn.logger", paste0("logger.", level))
@@ -233,7 +232,6 @@ calculate_sipnet_vpd <- function(Tair_C,
     message(paste0(..., collapse = ""))
   }
 }
-
 
 .sipnet_tau_filename <- function(in.prefix,
                                  start_date,
@@ -254,7 +252,6 @@ calculate_sipnet_vpd <- function(Tair_C,
     sep = "."
   )
 }
-
 
 .sipnet_tau_result <- function(file,
                                start_date,
