@@ -16,8 +16,8 @@
 #' @param dt_days Numeric timestep length in days. May be a scalar or have the
 #'   same length as `Tair_C`.
 #' @param tau_days Positive soil-temperature response time in days.
-#' @param initial_soilT_C Optional soil-temperature state immediately before
-#'   the first timestep. If `NULL`, the first air temperature is used.
+#' @param initial_soilT_C Optional first modeled soil temperature. If `NULL`,
+#'   the first air temperature is used.
 #'
 #' @return A list containing `soilT_C`, `final_soilT_C`, and the timestep-level
 #'   response coefficient `alpha`.
@@ -89,6 +89,70 @@ generate_soilT_from_tau <- function(Tair_C,
     final_soilT_C = soilT_C[[length(soilT_C)]],
     alpha = alpha
   )
+}
+
+
+#' Generate permafrost soil temperature with asymmetric air coupling
+#'
+#' Transforms air temperature using the permafrost process model fitted in
+#' `SoilT_tau_permafrost_functions.R`,
+#'
+#' \deqn{T^*_{air} = a + n_{warm}\max(T_{air}, 0) +
+#'   n_{cold}\min(T_{air}, 0),}
+#'
+#' and then passes effective air temperature through
+#' [generate_soilT_from_tau()].
+#'
+#' @inheritParams generate_soilT_from_tau
+#' @param a_C Baseline thermal offset in degrees Celsius.
+#' @param n_warm Nonnegative warm-condition air-to-soil coupling coefficient.
+#' @param n_cold Nonnegative cold-condition air-to-soil coupling coefficient.
+#'
+#' @return A list containing `soilT_C`, `final_soilT_C`, `alpha`, and
+#'   `effective_Tair_C`.
+#'
+#' @md
+#' @export
+#' @author Yang Gu
+generate_permafrost_soilT_from_tau <- function(Tair_C,
+                                               dt_days,
+                                               tau_days,
+                                               a_C,
+                                               n_warm,
+                                               n_cold,
+                                               initial_soilT_C = NULL) {
+  raw_parameters <- list(a_C = a_C, n_warm = n_warm, n_cold = n_cold)
+  valid_parameter_length <- vapply(
+    raw_parameters,
+    length,
+    integer(1)
+  ) == 1L
+  parameters <- c(
+    a_C = as.numeric(a_C)[1L],
+    n_warm = as.numeric(n_warm)[1L],
+    n_cold = as.numeric(n_cold)[1L]
+  )
+  if (any(!valid_parameter_length) || any(!is.finite(parameters))) {
+    stop("Permafrost parameters must be three finite scalars.", call. = FALSE)
+  }
+  if (parameters[["n_warm"]] < 0 || parameters[["n_cold"]] < 0) {
+    stop("`n_warm` and `n_cold` must be nonnegative.", call. = FALSE)
+  }
+  
+  Tair_C <- as.numeric(Tair_C)
+  effective_Tair_C <-
+    parameters[["a_C"]] +
+    parameters[["n_warm"]] * pmax(Tair_C, 0) +
+    parameters[["n_cold"]] * pmin(Tair_C, 0)
+  
+  result <- generate_soilT_from_tau(
+    Tair_C = effective_Tair_C,
+    dt_days = dt_days,
+    tau_days = tau_days,
+    initial_soilT_C = initial_soilT_C
+  )
+  result$effective_Tair_C <- effective_Tair_C
+  result
 }
 
 
@@ -224,6 +288,7 @@ calculate_sipnet_vpd <- function(Tair_C,
   )
 }
 
+
 .sipnet_tau_log <- function(level, ...) {
   if (requireNamespace("PEcAn.logger", quietly = TRUE)) {
     logger <- getExportedValue("PEcAn.logger", paste0("logger.", level))
@@ -232,6 +297,7 @@ calculate_sipnet_vpd <- function(Tair_C,
     message(paste0(..., collapse = ""))
   }
 }
+
 
 .sipnet_tau_filename <- function(in.prefix,
                                  start_date,
@@ -253,10 +319,15 @@ calculate_sipnet_vpd <- function(Tair_C,
   )
 }
 
+
 .sipnet_tau_result <- function(file,
                                start_date,
                                end_date,
                                soil_tau_days,
+                               soil_temperature_model,
+                               a_C,
+                               n_warm,
+                               n_cold,
                                tau_applied,
                                status) {
   host <- if (requireNamespace("PEcAn.remote", quietly = TRUE)) {
@@ -274,7 +345,10 @@ calculate_sipnet_vpd <- function(Tair_C,
     enddate = as.POSIXlt(end_date, tz = "UTC"),
     dbfile.name = basename(file),
     soil_tau_days = soil_tau_days,
-    soil_temperature_source = "tau",
+    soil_temperature_source = soil_temperature_model,
+    a_C = a_C,
+    n_warm = n_warm,
+    n_cold = n_cold,
     tau_applied = tau_applied,
     status = status,
     stringsAsFactors = FALSE
@@ -335,10 +409,11 @@ calculate_sipnet_vpd <- function(Tair_C,
 #' Generate a tau-corrected SIPNET climate file
 #'
 #' Uses the official [PEcAn.SIPNET::met2model.SIPNET()] function to generate a
-#' standard SIPNET climate file, then replaces soil temperature with a causal
-#' tau-filtered estimate and regenerates soil VPD from the new soil temperature
-#' and PEcAn-generated canopy-air vapor pressure. All other forcing columns are
-#' retained exactly as produced by PEcAn.
+#' standard SIPNET climate file, then replaces soil temperature with either a
+#' causal tau-filtered estimate or the asymmetric permafrost process model and
+#' regenerates soil VPD from the new soil temperature and PEcAn-generated
+#' canopy-air vapor pressure. All other forcing columns are retained as
+#' produced by PEcAn.
 #'
 #' SIPNET v2 climate files contain 12 columns. Legacy v1 files contain the same
 #' 12 forcing columns plus a leading grid index and trailing soil-wetness
@@ -352,8 +427,15 @@ calculate_sipnet_vpd <- function(Tair_C,
 #'
 #' @inheritParams PEcAn.SIPNET::met2model.SIPNET
 #' @param soil_tau_days Positive soil-temperature response time in days.
-#' @param initial_soilT_C Optional soil-temperature state immediately before
-#'   the first output timestep. If `NULL`, the first air temperature is used.
+#' @param soil_temperature_model Soil-temperature process: `"non_permafrost"`
+#'   applies the causal tau filter directly to air temperature;
+#'   `"permafrost"` first applies the asymmetric `a_C`, `n_warm`, and `n_cold`
+#'   transformation.
+#' @param a_C Baseline thermal offset for the permafrost model.
+#' @param n_warm Warm-condition coupling for the permafrost model.
+#' @param n_cold Cold-condition coupling for the permafrost model.
+#' @param initial_soilT_C Optional first modeled soil temperature. If `NULL`,
+#'   the first effective air temperature is used.
 #' @param clamp_soil_vpd Logical. If `TRUE`, negative soil VPD is set to zero.
 #' @param met2model_function Optional function used to generate the base SIPNET
 #'   climate file. `NULL` uses `PEcAn.SIPNET::met2model.SIPNET()`. This argument
@@ -378,6 +460,11 @@ met2model.SIPNET_tau <- function(in.path,
                                  start_date,
                                  end_date,
                                  soil_tau_days,
+                                 soil_temperature_model =
+                                   c("non_permafrost", "permafrost"),
+                                 a_C = NA_real_,
+                                 n_warm = NA_real_,
+                                 n_cold = NA_real_,
                                  var.names = NULL,
                                  initial_soilT_C = NULL,
                                  overwrite = FALSE,
@@ -388,12 +475,42 @@ met2model.SIPNET_tau <- function(in.path,
                                  met2model_function = NULL,
                                  ...) {
   clim_format_version <- match.arg(clim_format_version)
+  soil_temperature_model <- match.arg(soil_temperature_model)
   soil_tau_days <- as.numeric(soil_tau_days)
   
   if (length(soil_tau_days) != 1L ||
       !is.finite(soil_tau_days) ||
       soil_tau_days <= 0) {
     stop("`soil_tau_days` must be one positive finite value.", call. = FALSE)
+  }
+  if (soil_temperature_model == "permafrost") {
+    raw_parameters <- list(a_C = a_C, n_warm = n_warm, n_cold = n_cold)
+    valid_parameter_length <- vapply(
+      raw_parameters,
+      length,
+      integer(1)
+    ) == 1L
+    permafrost_parameters <- c(
+      a_C = as.numeric(a_C)[1L],
+      n_warm = as.numeric(n_warm)[1L],
+      n_cold = as.numeric(n_cold)[1L]
+    )
+    if (any(!valid_parameter_length) ||
+        any(!is.finite(permafrost_parameters)) ||
+        permafrost_parameters[["n_warm"]] < 0 ||
+        permafrost_parameters[["n_cold"]] < 0) {
+      stop(
+        "Permafrost mode requires finite `a_C` and nonnegative finite `n_warm` and `n_cold`.",
+        call. = FALSE
+      )
+    }
+    a_C <- permafrost_parameters[["a_C"]]
+    n_warm <- permafrost_parameters[["n_warm"]]
+    n_cold <- permafrost_parameters[["n_cold"]]
+  } else {
+    a_C <- NA_real_
+    n_warm <- NA_real_
+    n_cold <- NA_real_
   }
   start_date_parsed <- as.Date(start_date)
   end_date_parsed <- as.Date(end_date)
@@ -431,6 +548,10 @@ met2model.SIPNET_tau <- function(in.path,
       start_date = start_date_parsed,
       end_date = end_date_parsed,
       soil_tau_days = soil_tau_days,
+      soil_temperature_model = soil_temperature_model,
+      a_C = a_C,
+      n_warm = n_warm,
+      n_cold = n_cold,
       tau_applied = FALSE,
       status = "EXISTS_NOT_OVERWRITTEN"
     )))
@@ -536,12 +657,24 @@ met2model.SIPNET_tau <- function(in.path,
   timestep_days[timestep_days < 0] <-
     -timestep_days[timestep_days < 0] / 86400
   
-  soil_temperature <- generate_soilT_from_tau(
-    Tair_C = clim[[air_temperature_column]],
-    dt_days = timestep_days,
-    tau_days = soil_tau_days,
-    initial_soilT_C = initial_soilT_C
-  )
+  soil_temperature <- if (soil_temperature_model == "permafrost") {
+    generate_permafrost_soilT_from_tau(
+      Tair_C = clim[[air_temperature_column]],
+      dt_days = timestep_days,
+      tau_days = soil_tau_days,
+      a_C = a_C,
+      n_warm = n_warm,
+      n_cold = n_cold,
+      initial_soilT_C = initial_soilT_C
+    )
+  } else {
+    generate_soilT_from_tau(
+      Tair_C = clim[[air_temperature_column]],
+      dt_days = timestep_days,
+      tau_days = soil_tau_days,
+      initial_soilT_C = initial_soilT_C
+    )
+  }
   vapor_pressure <- calculate_sipnet_vpd(
     Tair_C = clim[[air_temperature_column]],
     soilT_C = soil_temperature$soilT_C,
@@ -570,7 +703,10 @@ met2model.SIPNET_tau <- function(in.path,
   result$file <- output_file
   result$dbfile.name <- basename(output_file)
   result$soil_tau_days <- soil_tau_days
-  result$soil_temperature_source <- "tau"
+  result$soil_temperature_source <- soil_temperature_model
+  result$a_C <- a_C
+  result$n_warm <- n_warm
+  result$n_cold <- n_cold
   result$initial_soilT_C <- if (is.null(initial_soilT_C)) {
     NA_real_
   } else {
@@ -588,31 +724,69 @@ met2model.SIPNET_tau <- function(in.path,
 }
 
 
-.extract_pft_tau_table <- function(pft_tau_test) {
+.extract_pft_parameter_table <- function(pft_tau_test,
+                                         soil_temperature_model) {
   if (is.data.frame(pft_tau_test)) {
-    pft_tau <- pft_tau_test
-  } else if (is.list(pft_tau_test) &&
-             !is.null(pft_tau_test$pft_tau) &&
-             is.data.frame(pft_tau_test$pft_tau)) {
-    pft_tau <- pft_tau_test$pft_tau
+    pft_parameters <- pft_tau_test
+  } else if (is.list(pft_tau_test)) {
+    component_names <- c("pft_parameters", "pft_tau", "summary")
+    valid_components <- component_names[vapply(
+      component_names,
+      function(component) is.data.frame(pft_tau_test[[component]]),
+      logical(1)
+    )]
+    if (length(valid_components) == 0L) {
+      stop(
+        "`pft_tau_test` contains no PFT parameter data.frame.",
+        call. = FALSE
+      )
+    }
+    pft_parameters <- pft_tau_test[[valid_components[[1L]]]]
   } else {
     stop(
-      "`pft_tau_test` must be a data.frame or contain data.frame `pft_tau`.",
+      "`pft_tau_test` must be a data.frame or contain a parameter table.",
       call. = FALSE
     )
   }
   
-  required_columns <- c("final_pft", "pft_tau_days")
-  missing_columns <- setdiff(required_columns, names(pft_tau))
-  if (length(missing_columns) > 0L) {
+  if (!"final_pft" %in% names(pft_parameters)) {
+    stop("PFT parameter table is missing `final_pft`.", call. = FALSE)
+  }
+  
+  tau_column <- intersect(
+    c("pft_tau_days", "tau_days"),
+    names(pft_parameters)
+  )
+  if (length(tau_column) == 0L) {
     stop(
-      "PFT tau table is missing: ",
-      paste(missing_columns, collapse = ", "),
+      "PFT parameter table must contain `pft_tau_days` or `tau_days`.",
       call. = FALSE
     )
   }
+  pft_parameters$pft_tau_days <- pft_parameters[[tau_column[[1L]]]]
   
-  pft_tau
+  if (soil_temperature_model == "permafrost") {
+    for (parameter in c("a_C", "n_warm", "n_cold")) {
+      parameter_column <- intersect(
+        c(paste0("pft_", parameter), parameter),
+        names(pft_parameters)
+      )
+      if (length(parameter_column) == 0L) {
+        stop(
+          "Permafrost PFT parameter table is missing `",
+          parameter,
+          "` or `pft_",
+          parameter,
+          "`.",
+          call. = FALSE
+        )
+      }
+      pft_parameters[[parameter]] <-
+        pft_parameters[[parameter_column[[1L]]]]
+    }
+  }
+  
+  pft_parameters
 }
 
 
@@ -642,8 +816,10 @@ met2model.SIPNET_tau <- function(in.path,
 #' @param lookup A data.frame or data.table containing unique model `index`
 #'   values.
 #' @param newpft A data.frame or data.table containing `index` and `final_pft`.
-#' @param pft_tau_test A data.frame with `final_pft` and `pft_tau_days`, or a
-#'   list containing that table as `pft_tau`.
+#' @param pft_tau_test A PFT parameter data.frame or a list containing one as
+#'   `pft_parameters`, `pft_tau`, or `summary`. Non-permafrost mode requires
+#'   `final_pft` and `pft_tau_days` (or `tau_days`). Permafrost mode also
+#'   requires `a_C`, `n_warm`, and `n_cold`; `pft_`-prefixed names are accepted.
 #' @param pft_name Character name of the PFT to process.
 #' @param input_root Root containing PEcAn-standardized ERA5 directories.
 #' @param output_root Root where tau-corrected forcing directories and the
@@ -655,6 +831,8 @@ met2model.SIPNET_tau <- function(in.path,
 #' @param overwrite Logical indicating whether existing tau climate files may
 #'   be replaced.
 #' @param verbose Logical indicating whether to print progress messages.
+#' @param soil_temperature_model Soil-temperature process passed to
+#'   [met2model.SIPNET_tau()].
 #' @param clim_format_version SIPNET climate format. Current SIPNET uses `"v2"`
 #'   (12 columns); `"v1"` writes the legacy 14-column format.
 #' @param initial_soilT_C Optional initial soil-temperature state passed to
@@ -686,15 +864,20 @@ generate_tau_clims_for_pft <- function(
     n_cores = 6L,
     overwrite = TRUE,
     verbose = TRUE,
+    soil_temperature_model = c("non_permafrost", "permafrost"),
     clim_format_version = c("v2", "v1"),
     initial_soilT_C = NULL,
     clamp_soil_vpd = TRUE,
     stop_on_error = FALSE,
     met2model_function = NULL) {
+  soil_temperature_model <- match.arg(soil_temperature_model)
   clim_format_version <- match.arg(clim_format_version)
   lookup <- as.data.frame(lookup, stringsAsFactors = FALSE)
   newpft <- as.data.frame(newpft, stringsAsFactors = FALSE)
-  pft_tau <- .extract_pft_tau_table(pft_tau_test)
+  pft_parameters <- .extract_pft_parameter_table(
+    pft_tau_test,
+    soil_temperature_model
+  )
   
   if (!"index" %in% names(lookup)) {
     stop("`lookup` must contain `index`.", call. = FALSE)
@@ -714,17 +897,35 @@ generate_tau_clims_for_pft <- function(
     stop("`pft_name` must be one nonempty character value.", call. = FALSE)
   }
   
-  tau_rows <- pft_tau[as.character(pft_tau$final_pft) == pft_name, , drop = FALSE]
-  if (nrow(tau_rows) != 1L) {
+  parameter_rows <- pft_parameters[
+    as.character(pft_parameters$final_pft) == pft_name,
+    ,
+    drop = FALSE
+  ]
+  if (nrow(parameter_rows) != 1L) {
     stop(
-      "Expected exactly one PFT tau row for `", pft_name,
-      "`; found ", nrow(tau_rows), ".",
+      "Expected exactly one PFT parameter row for `", pft_name,
+      "`; found ", nrow(parameter_rows), ".",
       call. = FALSE
     )
   }
-  tau_days <- as.numeric(tau_rows$pft_tau_days[[1L]])
+  tau_days <- as.numeric(parameter_rows$pft_tau_days[[1L]])
   if (!is.finite(tau_days) || tau_days <= 0) {
     stop("PFT tau must be one positive finite value.", call. = FALSE)
+  }
+  if (soil_temperature_model == "permafrost") {
+    a_C <- as.numeric(parameter_rows$a_C[[1L]])
+    n_warm <- as.numeric(parameter_rows$n_warm[[1L]])
+    n_cold <- as.numeric(parameter_rows$n_cold[[1L]])
+    if (!is.finite(a_C) ||
+        !is.finite(n_warm) || n_warm < 0 ||
+        !is.finite(n_cold) || n_cold < 0) {
+      stop("Invalid permafrost PFT process parameters.", call. = FALSE)
+    }
+  } else {
+    a_C <- NA_real_
+    n_warm <- NA_real_
+    n_cold <- NA_real_
   }
   
   pft_indices <- unique(newpft$index[
@@ -791,7 +992,11 @@ generate_tau_clims_for_pft <- function(
       index = index_i,
       member = member_i,
       final_pft = pft_name,
+      soil_temperature_model = soil_temperature_model,
       tau_days = tau_days,
+      a_C = a_C,
+      n_warm = n_warm,
+      n_cold = n_cold,
       input_dir = input_dir,
       output_dir = output_dir,
       new_clim_path = NA_character_,
@@ -819,6 +1024,10 @@ generate_tau_clims_for_pft <- function(
         start_date = start_date,
         end_date = end_date,
         soil_tau_days = tau_days,
+        soil_temperature_model = soil_temperature_model,
+        a_C = a_C,
+        n_warm = n_warm,
+        n_cold = n_cold,
         initial_soilT_C = initial_soilT_C,
         overwrite = overwrite,
         verbose = FALSE,
@@ -937,15 +1146,20 @@ generate_tau_clims_for_all_pfts <- function(
     overwrite = TRUE,
     verbose = TRUE,
     missing_tau_action = c("error", "skip"),
+    soil_temperature_model = c("non_permafrost", "permafrost"),
     clim_format_version = c("v2", "v1"),
     initial_soilT_C = NULL,
     clamp_soil_vpd = TRUE,
     stop_on_error = FALSE,
     met2model_function = NULL) {
   missing_tau_action <- match.arg(missing_tau_action)
+  soil_temperature_model <- match.arg(soil_temperature_model)
   clim_format_version <- match.arg(clim_format_version)
   newpft <- as.data.frame(newpft, stringsAsFactors = FALSE)
-  pft_tau <- .extract_pft_tau_table(pft_tau_test)
+  pft_parameters <- .extract_pft_parameter_table(
+    pft_tau_test,
+    soil_temperature_model
+  )
   
   if (!all(c("index", "final_pft") %in% names(newpft))) {
     stop("`newpft` must contain `index` and `final_pft`.", call. = FALSE)
@@ -953,10 +1167,10 @@ generate_tau_clims_for_all_pfts <- function(
   
   assigned_pfts <- unique(as.character(newpft$final_pft))
   assigned_pfts <- assigned_pfts[!is.na(assigned_pfts) & nzchar(assigned_pfts)]
-  tau_pfts <- unique(as.character(pft_tau$final_pft))
+  parameter_pfts <- unique(as.character(pft_parameters$final_pft))
   
   if (is.null(pfts)) {
-    pfts <- sort(intersect(assigned_pfts, tau_pfts))
+    pfts <- sort(intersect(assigned_pfts, parameter_pfts))
   } else {
     pfts <- unique(as.character(pfts))
     pfts <- pfts[!is.na(pfts) & nzchar(pfts)]
@@ -965,20 +1179,33 @@ generate_tau_clims_for_all_pfts <- function(
     stop("No PFTs are available for climate generation.", call. = FALSE)
   }
   
-  tau_count <- vapply(pfts, function(pft_name) {
-    rows <- pft_tau[as.character(pft_tau$final_pft) == pft_name, , drop = FALSE]
+  parameter_count <- vapply(pfts, function(pft_name) {
+    rows <- pft_parameters[
+      as.character(pft_parameters$final_pft) == pft_name,
+      ,
+      drop = FALSE
+    ]
     tau_value <- suppressWarnings(as.numeric(rows$pft_tau_days))
-    as.integer(
+    valid <-
       nrow(rows) == 1L &&
-        length(tau_value) == 1L &&
-        is.finite(tau_value) &&
-        tau_value > 0
-    )
+      length(tau_value) == 1L &&
+      is.finite(tau_value) &&
+      tau_value > 0
+    if (valid && soil_temperature_model == "permafrost") {
+      a_value <- suppressWarnings(as.numeric(rows$a_C))
+      warm_value <- suppressWarnings(as.numeric(rows$n_warm))
+      cold_value <- suppressWarnings(as.numeric(rows$n_cold))
+      valid <-
+        length(a_value) == 1L && is.finite(a_value) &&
+        length(warm_value) == 1L && is.finite(warm_value) && warm_value >= 0 &&
+        length(cold_value) == 1L && is.finite(cold_value) && cold_value >= 0
+    }
+    as.integer(valid)
   }, integer(1))
-  invalid_pfts <- pfts[tau_count != 1L]
+  invalid_pfts <- pfts[parameter_count != 1L]
   if (length(invalid_pfts) > 0L && missing_tau_action == "error") {
     stop(
-      "PFTs without exactly one valid tau: ",
+      "PFTs without exactly one valid process-parameter row: ",
       paste(invalid_pfts, collapse = ", "),
       call. = FALSE
     )
@@ -987,7 +1214,7 @@ generate_tau_clims_for_all_pfts <- function(
     if (isTRUE(verbose)) {
       .sipnet_tau_log(
         "warn",
-        "Skipping PFTs without exactly one valid tau: ",
+        "Skipping PFTs without exactly one valid process-parameter row: ",
         paste(invalid_pfts, collapse = ", ")
       )
     }
@@ -1019,7 +1246,7 @@ generate_tau_clims_for_all_pfts <- function(
       generate_tau_clims_for_pft(
         lookup = lookup,
         newpft = newpft,
-        pft_tau_test = pft_tau,
+        pft_tau_test = pft_parameters,
         pft_name = pft_name,
         input_root = input_root,
         output_root = output_root,
@@ -1029,6 +1256,7 @@ generate_tau_clims_for_all_pfts <- function(
         n_cores = n_cores,
         overwrite = overwrite,
         verbose = verbose,
+        soil_temperature_model = soil_temperature_model,
         clim_format_version = clim_format_version,
         initial_soilT_C = initial_soilT_C,
         clamp_soil_vpd = clamp_soil_vpd,
@@ -1040,7 +1268,11 @@ generate_tau_clims_for_all_pfts <- function(
           index = NA_integer_,
           member = NA_integer_,
           final_pft = pft_name,
+          soil_temperature_model = soil_temperature_model,
           tau_days = NA_real_,
+          a_C = NA_real_,
+          n_warm = NA_real_,
+          n_cold = NA_real_,
           input_dir = NA_character_,
           output_dir = output_root,
           new_clim_path = NA_character_,
@@ -1086,4 +1318,857 @@ generate_tau_clims_for_all_pfts <- function(
   }
   
   invisible(combined_manifest)
+}
+
+
+# =============================================================================
+# NEON-observation-first, site-tau gap-filled SIPNET climate files
+# =============================================================================
+
+.neon_tau_clim_layout <- function(number_of_columns) {
+  if (number_of_columns == 12L) {
+    return(list(
+      year = 1L,
+      doy = 2L,
+      hour = 3L,
+      timestep = 4L,
+      air_temperature = 5L,
+      soil_temperature = 6L,
+      air_vpd = 9L,
+      soil_vpd = 10L,
+      air_vapor_pressure = 11L
+    ))
+  }
+  
+  if (number_of_columns == 14L) {
+    return(list(
+      year = 2L,
+      doy = 3L,
+      hour = 4L,
+      timestep = 5L,
+      air_temperature = 6L,
+      soil_temperature = 7L,
+      air_vpd = 10L,
+      soil_vpd = 11L,
+      air_vapor_pressure = 12L
+    ))
+  }
+  
+  stop(
+    "Expected a 12-column SIPNET v2 or 14-column SIPNET v1 climate file; found ",
+    number_of_columns,
+    " columns.",
+    call. = FALSE
+  )
+}
+
+
+.sipnet_clim_timestamp <- function(clim, layout) {
+  year <- suppressWarnings(as.integer(clim[[layout$year]]))
+  doy <- suppressWarnings(as.integer(clim[[layout$doy]]))
+  hour <- suppressWarnings(as.numeric(clim[[layout$hour]]))
+  
+  day_start <- as.POSIXct(
+    strptime(
+      paste(year, doy),
+      format = "%Y %j",
+      tz = "UTC"
+    ),
+    tz = "UTC"
+  )
+  timestamp <- day_start + hour * 3600
+  
+  if (anyNA(timestamp)) {
+    stop(
+      "Could not construct timestamps from the climate year/day/hour columns.",
+      call. = FALSE
+    )
+  }
+  
+  timestamp
+}
+
+
+.extract_neon_tsoil_for_clim <- function(multi_site,
+                                         index,
+                                         vertical_position,
+                                         start_time,
+                                         end_time) {
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Package `data.table` is required.", call. = FALSE)
+  }
+  
+  target_index <- as.integer(index)[1L]
+  if (!is.finite(target_index)) {
+    stop("`index` must be one valid integer.", call. = FALSE)
+  }
+  
+  soil_temperature <- getElement(multi_site, "soilT")
+  if (is.null(soil_temperature)) {
+    stop("`multi_site` does not contain `soilT`.", call. = FALSE)
+  }
+  
+  soil_temperature <- data.table::as.data.table(
+    data.table::copy(soil_temperature)
+  )
+  required_columns <- c("index", "verticalPosition", "time", "SoilT")
+  missing_columns <- setdiff(required_columns, names(soil_temperature))
+  if (length(missing_columns) > 0L) {
+    stop(
+      "`multi_site$soilT` is missing: ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  soil_temperature[
+    ,
+    timestamp := as.POSIXct(time, tz = "UTC")
+  ]
+  soil_temperature[
+    ,
+    SoilT := suppressWarnings(as.numeric(SoilT))
+  ]
+  
+  selected <- soil_temperature[
+    as.integer(index) == target_index &
+      as.character(verticalPosition) == as.character(vertical_position) &
+      !is.na(timestamp) &
+      timestamp >= start_time &
+      timestamp < end_time &
+      is.finite(SoilT),
+    .(
+      Tsoil_NEON_C = mean(SoilT, na.rm = TRUE)
+    ),
+    by = timestamp
+  ]
+  
+  data.table::setorder(selected, timestamp)
+  selected
+}
+
+
+.match_neon_tsoil_to_clim <- function(clim_timestamp,
+                                      neon_observations,
+                                      tolerance_seconds = 60) {
+  matched <- rep(NA_real_, length(clim_timestamp))
+  if (nrow(neon_observations) == 0L) {
+    return(matched)
+  }
+  
+  tolerance_seconds <- as.numeric(tolerance_seconds)[1L]
+  if (!is.finite(tolerance_seconds) || tolerance_seconds < 0) {
+    stop("`tolerance_seconds` must be nonnegative.", call. = FALSE)
+  }
+  
+  target_seconds <- as.numeric(clim_timestamp)
+  observation_seconds <- as.numeric(neon_observations$timestamp)
+  order_index <- order(observation_seconds)
+  observation_seconds <- observation_seconds[order_index]
+  observation_values <- neon_observations$Tsoil_NEON_C[order_index]
+  
+  lower_position <- findInterval(target_seconds, observation_seconds)
+  lower_index <- pmax(1L, lower_position)
+  upper_index <- pmin(length(observation_seconds), lower_position + 1L)
+  
+  lower_distance <- abs(target_seconds - observation_seconds[lower_index])
+  upper_distance <- abs(target_seconds - observation_seconds[upper_index])
+  use_upper <- upper_distance < lower_distance
+  nearest_index <- lower_index
+  nearest_index[use_upper] <- upper_index[use_upper]
+  nearest_distance <- pmin(lower_distance, upper_distance)
+  
+  within_tolerance <- nearest_distance <= tolerance_seconds
+  matched[within_tolerance] <- observation_values[
+    nearest_index[within_tolerance]
+  ]
+  matched
+}
+
+
+.select_site_tau_parameters <- function(parameter_table,
+                                        index,
+                                        vertical_position,
+                                        soil_temperature_model,
+                                        default_a_C,
+                                        default_n_warm,
+                                        default_n_cold) {
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Package `data.table` is required.", call. = FALSE)
+  }
+  
+  target_index <- as.integer(index)[1L]
+  if (!is.finite(target_index)) {
+    stop("`index` must be one valid integer.", call. = FALSE)
+  }
+  
+  parameters <- data.table::as.data.table(
+    data.table::copy(parameter_table)
+  )
+  if (!"index" %in% names(parameters) || !"tau_days" %in% names(parameters)) {
+    stop(
+      "Each parameter table must contain `index` and `tau_days`.",
+      call. = FALSE
+    )
+  }
+  
+  depth_column <- intersect(
+    c("vertical_position", "verticalPosition"),
+    names(parameters)
+  )
+  if (length(depth_column) > 0L) {
+    parameters <- parameters[
+      as.character(get(depth_column[1L])) == as.character(vertical_position)
+    ]
+  }
+  parameters <- parameters[as.integer(index) == target_index]
+  
+  if (nrow(parameters) != 1L) {
+    stop(
+      "Expected exactly one ",
+      soil_temperature_model,
+      " parameter row for index=",
+      target_index,
+      " and VER=",
+      vertical_position,
+      "; found ",
+      nrow(parameters),
+      ".",
+      call. = FALSE
+    )
+  }
+  
+  tau_days <- suppressWarnings(as.numeric(parameters$tau_days[1L]))
+  if (!is.finite(tau_days) || tau_days <= 0) {
+    stop("Selected `tau_days` is not positive and finite.", call. = FALSE)
+  }
+  
+  first_finite_parameter <- function(candidate_columns, fallback) {
+    for (column_name in candidate_columns) {
+      if (column_name %in% names(parameters)) {
+        value <- suppressWarnings(as.numeric(parameters[[column_name]][1L]))
+        if (is.finite(value)) {
+          return(value)
+        }
+      }
+    }
+    as.numeric(fallback)[1L]
+  }
+  
+  list(
+    tau_days = tau_days,
+    offset_C = first_finite_parameter("offset_C", 0),
+    a_C = first_finite_parameter(c("a_C", "fixed_a_C"), default_a_C),
+    n_warm = first_finite_parameter(
+      c("n_warm", "fixed_n_warm"),
+      default_n_warm
+    ),
+    n_cold = first_finite_parameter(
+      c("n_cold", "fixed_n_cold"),
+      default_n_cold
+    )
+  )
+}
+
+
+#' Fill missing NEON soil temperature using a site-specific tau model
+#'
+#' At a timestep with a finite NEON observation, the returned soil temperature
+#' equals that observation and the thermal state is reset to it. At a missing
+#' timestep, the state advances with the causal tau recursion. Non-permafrost
+#' sites use air temperature directly; permafrost sites first apply the
+#' asymmetric warm/cold air-temperature transformation.
+#'
+#' @param Tair_C Air temperature in degrees Celsius.
+#' @param dt_days Timestep duration in days.
+#' @param Tsoil_NEON_C NEON soil temperature aligned to the climate timesteps;
+#'   missing observations must be `NA`.
+#' @param tau_days Positive site- and depth-specific MLE tau in days.
+#' @param soil_temperature_model Either `"non_permafrost"` or `"permafrost"`.
+#' @param offset_C Additive offset for the non-permafrost tau model.
+#' @param a_C,n_warm,n_cold Permafrost process parameters.
+#' @param initial_soilT_C Optional initial soil temperature before observations.
+#'
+#' @return A list containing final hybrid soil temperature, the tau prediction
+#'   before any observation update, source labels, and the effective air
+#'   temperature used by the recursion.
+#'
+#' @md
+#' @export
+#' @author Yang Gu
+fill_neon_tsoil_gaps_with_tau <- function(
+    Tair_C,
+    dt_days,
+    Tsoil_NEON_C,
+    tau_days,
+    soil_temperature_model = c("non_permafrost", "permafrost"),
+    offset_C = 0,
+    a_C = 0,
+    n_warm = 1,
+    n_cold = 0.3,
+    initial_soilT_C = NULL
+) {
+  soil_temperature_model <- match.arg(soil_temperature_model)
+  Tair_C <- as.numeric(Tair_C)
+  dt_days <- as.numeric(dt_days)
+  Tsoil_NEON_C <- as.numeric(Tsoil_NEON_C)
+  tau_days <- as.numeric(tau_days)[1L]
+  
+  number_of_timesteps <- length(Tair_C)
+  if (number_of_timesteps == 0L ||
+      length(Tsoil_NEON_C) != number_of_timesteps ||
+      any(!is.finite(Tair_C))) {
+    stop(
+      "Air temperature and aligned NEON soil temperature must have equal, nonzero length.",
+      call. = FALSE
+    )
+  }
+  if (length(dt_days) == 1L) {
+    dt_days <- rep(dt_days, number_of_timesteps)
+  }
+  if (length(dt_days) != number_of_timesteps ||
+      any(!is.finite(dt_days)) ||
+      any(dt_days <= 0)) {
+    stop("All climate timesteps must be positive and finite.", call. = FALSE)
+  }
+  if (!is.finite(tau_days) || tau_days <= 0) {
+    stop("`tau_days` must be positive and finite.", call. = FALSE)
+  }
+  
+  offset_C <- as.numeric(offset_C)[1L]
+  if (!is.finite(offset_C)) {
+    offset_C <- 0
+  }
+  
+  if (soil_temperature_model == "permafrost") {
+    process_parameters <- c(
+      a_C = as.numeric(a_C)[1L],
+      n_warm = as.numeric(n_warm)[1L],
+      n_cold = as.numeric(n_cold)[1L]
+    )
+    if (any(!is.finite(process_parameters)) ||
+        process_parameters[["n_warm"]] < 0 ||
+        process_parameters[["n_cold"]] < 0) {
+      stop("Invalid permafrost process parameters.", call. = FALSE)
+    }
+    effective_Tair_C <-
+      process_parameters[["a_C"]] +
+      process_parameters[["n_warm"]] * pmax(Tair_C, 0) +
+      process_parameters[["n_cold"]] * pmin(Tair_C, 0)
+    model_offset_C <- 0
+  } else {
+    effective_Tair_C <- Tair_C
+    model_offset_C <- offset_C
+  }
+  
+  alpha <- -expm1(-dt_days / tau_days)
+  hybrid_soilT_C <- numeric(number_of_timesteps)
+  tau_prediction_C <- numeric(number_of_timesteps)
+  source <- character(number_of_timesteps)
+  
+  initial_value <- if (is.null(initial_soilT_C)) {
+    effective_Tair_C[1L] + model_offset_C
+  } else {
+    as.numeric(initial_soilT_C)[1L]
+  }
+  if (!is.finite(initial_value)) {
+    stop("`initial_soilT_C` must be NULL or one finite value.", call. = FALSE)
+  }
+  state <- initial_value - model_offset_C
+  
+  for (timestep_i in seq_len(number_of_timesteps)) {
+    if (timestep_i > 1L) {
+      state <- state +
+        alpha[timestep_i] *
+        (effective_Tair_C[timestep_i] - state)
+    }
+    
+    tau_prediction_C[timestep_i] <- state + model_offset_C
+    if (is.finite(Tsoil_NEON_C[timestep_i])) {
+      hybrid_soilT_C[timestep_i] <- Tsoil_NEON_C[timestep_i]
+      state <- Tsoil_NEON_C[timestep_i] - model_offset_C
+      source[timestep_i] <- "NEON_observed"
+    } else {
+      hybrid_soilT_C[timestep_i] <- tau_prediction_C[timestep_i]
+      source[timestep_i] <- "tau_gapfill"
+    }
+  }
+  
+  list(
+    soilT_C = hybrid_soilT_C,
+    tau_prediction_C = tau_prediction_C,
+    source = source,
+    effective_Tair_C = effective_Tair_C,
+    alpha = alpha,
+    final_soilT_C = hybrid_soilT_C[number_of_timesteps]
+  )
+}
+
+
+#' Generate one NEON-observation-first SIPNET climate file
+#'
+#' Reads an existing SIPNET climate file, inserts target-depth NEON soil
+#' temperature when observed, fills missing timesteps using the site-specific
+#' MLE tau process, recalculates soil VPD, and writes a new climate file while
+#' preserving all other forcing columns.
+#'
+#' @param input_clim_file Existing SIPNET climate file.
+#' @param output_clim_file Destination climate file.
+#' @param index Model-site index.
+#' @param multi_site Object containing `multi_site$soilT`.
+#' @param site_parameters List returned by `.select_site_tau_parameters()`.
+#' @param vertical_position Requested NEON depth code, for example `"502"`.
+#' @param start_date,end_date Inclusive output date range.
+#' @param soil_temperature_model Permafrost classification for this site.
+#' @param warmup_days Number of preceding climate days used to initialize the
+#'   causal thermal state. These rows are not written to the output file.
+#' @param observation_match_tolerance_seconds Maximum timestamp mismatch for a
+#'   NEON observation to be assigned to a climate timestep.
+#' @param initial_soilT_C Optional initial soil temperature.
+#' @param clamp_soil_vpd Whether negative soil VPD is set to zero.
+#' @param overwrite Whether an existing output may be replaced.
+#' @param write_diagnostics Whether to write a compressed timestep-level source
+#'   table next to the climate file.
+#'
+#' @return Invisibly returns one-row generation metadata.
+#'
+#' @md
+#' @export
+#' @author Yang Gu
+generate_neon_tau_gapfilled_clim <- function(
+    input_clim_file,
+    output_clim_file,
+    index,
+    multi_site,
+    site_parameters,
+    vertical_position = "502",
+    start_date,
+    end_date,
+    soil_temperature_model = c("non_permafrost", "permafrost"),
+    warmup_days = 180L,
+    observation_match_tolerance_seconds = 60,
+    initial_soilT_C = NULL,
+    clamp_soil_vpd = TRUE,
+    overwrite = FALSE,
+    write_diagnostics = TRUE
+) {
+  soil_temperature_model <- match.arg(soil_temperature_model)
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  if (is.na(start_date) || is.na(end_date) || end_date < start_date) {
+    stop("Invalid `start_date` or `end_date`.", call. = FALSE)
+  }
+  if (!file.exists(input_clim_file)) {
+    stop("Input climate file not found: ", input_clim_file, call. = FALSE)
+  }
+  if (file.exists(output_clim_file) && !isTRUE(overwrite)) {
+    return(invisible(data.frame(
+      index = as.integer(index),
+      vertical_position = as.character(vertical_position),
+      soil_temperature_model = soil_temperature_model,
+      tau_days = site_parameters$tau_days,
+      n_output_timesteps = NA_integer_,
+      n_neon_observed = NA_integer_,
+      n_tau_gapfilled = NA_integer_,
+      output_clim_file = output_clim_file,
+      diagnostics_file = NA_character_,
+      status = "EXISTS_NOT_OVERWRITTEN",
+      stringsAsFactors = FALSE
+    )))
+  }
+  
+  clim <- utils::read.table(
+    input_clim_file,
+    header = FALSE,
+    sep = "",
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  if (nrow(clim) == 0L) {
+    stop("Input climate file is empty.", call. = FALSE)
+  }
+  clim[] <- lapply(clim, function(value) {
+    suppressWarnings(as.numeric(value))
+  })
+  if (anyNA(clim)) {
+    stop("Input climate file contains nonnumeric or missing values.", call. = FALSE)
+  }
+  
+  layout <- .neon_tau_clim_layout(ncol(clim))
+  timestamp <- .sipnet_clim_timestamp(clim, layout)
+  start_time <- as.POSIXct(start_date, tz = "UTC")
+  end_time <- as.POSIXct(end_date + 1, tz = "UTC")
+  warmup_start_time <- start_time - as.numeric(warmup_days) * 86400
+  model_rows <- timestamp >= warmup_start_time & timestamp < end_time
+  output_rows <- timestamp >= start_time & timestamp < end_time
+  if (!any(output_rows)) {
+    stop("Input climate file does not overlap the requested dates.", call. = FALSE)
+  }
+  
+  clim_model <- clim[model_rows, , drop = FALSE]
+  model_timestamp <- timestamp[model_rows]
+  model_output_rows <- model_timestamp >= start_time & model_timestamp < end_time
+  timestep_days <- clim_model[[layout$timestep]]
+  timestep_days[timestep_days < 0] <-
+    -timestep_days[timestep_days < 0] / 86400
+  
+  neon_observations <- .extract_neon_tsoil_for_clim(
+    multi_site = multi_site,
+    index = index,
+    vertical_position = vertical_position,
+    start_time = warmup_start_time,
+    end_time = end_time
+  )
+  neon_aligned <- .match_neon_tsoil_to_clim(
+    clim_timestamp = model_timestamp,
+    neon_observations = neon_observations,
+    tolerance_seconds = observation_match_tolerance_seconds
+  )
+  
+  gapfilled <- fill_neon_tsoil_gaps_with_tau(
+    Tair_C = clim_model[[layout$air_temperature]],
+    dt_days = timestep_days,
+    Tsoil_NEON_C = neon_aligned,
+    tau_days = site_parameters$tau_days,
+    soil_temperature_model = soil_temperature_model,
+    offset_C = site_parameters$offset_C,
+    a_C = site_parameters$a_C,
+    n_warm = site_parameters$n_warm,
+    n_cold = site_parameters$n_cold,
+    initial_soilT_C = initial_soilT_C
+  )
+  vapor_pressure <- calculate_sipnet_vpd(
+    Tair_C = clim_model[[layout$air_temperature]],
+    soilT_C = gapfilled$soilT_C,
+    air_vapor_pressure_Pa = clim_model[[layout$air_vapor_pressure]],
+    clamp_soil_vpd = clamp_soil_vpd
+  )
+  
+  original_soil_temperature <- clim_model[[layout$soil_temperature]]
+  original_soil_vpd <- clim_model[[layout$soil_vpd]]
+  clim_model[[layout$soil_temperature]] <- gapfilled$soilT_C
+  clim_model[[layout$soil_vpd]] <- vapor_pressure$VPDsoil_Pa
+  clim_output <- clim_model[model_output_rows, , drop = FALSE]
+  
+  output_matrix <- as.matrix(clim_output)
+  if (anyNA(output_matrix) || any(!is.finite(output_matrix))) {
+    stop("Updated climate file contains missing/non-finite values.", call. = FALSE)
+  }
+  .write_sipnet_clim_atomic(
+    clim = clim_output,
+    path = output_clim_file,
+    overwrite = overwrite
+  )
+  
+  diagnostics_file <- NA_character_
+  if (isTRUE(write_diagnostics)) {
+    if (!requireNamespace("data.table", quietly = TRUE)) {
+      stop("Package `data.table` is required for diagnostics.", call. = FALSE)
+    }
+    diagnostics_file <- sub(
+      "\\.clim$",
+      "_soilT_diagnostics.csv.gz",
+      output_clim_file,
+      ignore.case = TRUE
+    )
+    if (identical(diagnostics_file, output_clim_file)) {
+      diagnostics_file <- paste0(
+        output_clim_file,
+        "_soilT_diagnostics.csv.gz"
+      )
+    }
+    diagnostic_table <- data.table::data.table(
+      timestamp = model_timestamp[model_output_rows],
+      index = as.integer(index),
+      vertical_position = as.character(vertical_position),
+      soil_temperature_model = soil_temperature_model,
+      tau_days = site_parameters$tau_days,
+      Tair_C = clim_model[[layout$air_temperature]][model_output_rows],
+      Tsoil_original_C = original_soil_temperature[model_output_rows],
+      Tsoil_NEON_C = neon_aligned[model_output_rows],
+      Tsoil_tau_prediction_C =
+        gapfilled$tau_prediction_C[model_output_rows],
+      Tsoil_final_C = gapfilled$soilT_C[model_output_rows],
+      Tsoil_source = gapfilled$source[model_output_rows],
+      VPDsoil_original_Pa = original_soil_vpd[model_output_rows],
+      VPDsoil_final_Pa = vapor_pressure$VPDsoil_Pa[model_output_rows]
+    )
+    data.table::fwrite(diagnostic_table, diagnostics_file)
+  }
+  
+  output_source <- gapfilled$source[model_output_rows]
+  invisible(data.frame(
+    index = as.integer(index),
+    vertical_position = as.character(vertical_position),
+    soil_temperature_model = soil_temperature_model,
+    tau_days = site_parameters$tau_days,
+    n_output_timesteps = length(output_source),
+    n_neon_observed = sum(output_source == "NEON_observed"),
+    n_tau_gapfilled = sum(output_source == "tau_gapfill"),
+    output_clim_file = output_clim_file,
+    diagnostics_file = diagnostics_file,
+    status = "GENERATED",
+    stringsAsFactors = FALSE
+  ))
+}
+
+
+#' Generate NEON-observation-first SIPNET climate files for all lookup sites
+#'
+#' Classifies sites as permafrost when `site_lat` is greater than the supplied
+#' latitude threshold, selects the corresponding site/depth MLE tau table, and
+#' calls [generate_neon_tau_gapfilled_clim()] for every index/member job.
+#'
+#' @param lookup Site lookup containing exactly one row per `index`, plus
+#'   `site_lat`; `NEON_code` is optional metadata.
+#' @param multi_site Pre-extracted NEON observations containing `soilT`.
+#' @param non_permafrost_parameters Site/depth MLE tau summary for sites at or
+#'   below the latitude threshold.
+#' @param permafrost_parameters Site/depth tau-only MLE summary for sites above
+#'   the latitude threshold.
+#' @param vertical_position Requested NEON depth code.
+#' @param start_date,end_date Inclusive output dates.
+#' @param input_root Root containing `ERA5_<index>_<member>` directories.
+#' @param output_root Root for updated climate files and the combined manifest.
+#' @param members ERA5/SIPNET ensemble-member numbers.
+#' @param input_clim_start_date,input_clim_end_date Dates embedded in the input
+#'   climate file names.
+#' @param permafrost_latitude_threshold Latitude above which a site is treated
+#'   as permafrost. A site exactly at the threshold is non-permafrost.
+#' @param permafrost_a_C,permafrost_n_warm,permafrost_n_cold Fallback fixed
+#'   process parameters when absent from the permafrost tau-only summary.
+#' @param workers Number of parallel workers.
+#' @param warmup_days Thermal-state warmup preceding the output interval.
+#' @param observation_match_tolerance_seconds Timestamp matching tolerance.
+#' @param overwrite Whether existing climate files may be replaced.
+#' @param write_diagnostics Whether to write timestep-level diagnostic tables.
+#' @param stop_on_error Whether any failed job stops after writing the manifest.
+#'
+#' @return Invisibly returns the combined job manifest.
+#'
+#' @md
+#' @export
+#' @author Yang Gu
+generate_neon_tau_gapfilled_clims <- function(
+    lookup,
+    multi_site,
+    non_permafrost_parameters,
+    permafrost_parameters,
+    vertical_position = "502",
+    start_date,
+    end_date,
+    input_root,
+    output_root,
+    members = 1L,
+    input_clim_start_date = "2012-01-01",
+    input_clim_end_date = "2024-12-31",
+    permafrost_latitude_threshold = 63,
+    permafrost_a_C = 0,
+    permafrost_n_warm = 1,
+    permafrost_n_cold = 0.3,
+    workers = 1L,
+    warmup_days = 180L,
+    observation_match_tolerance_seconds = 60,
+    overwrite = FALSE,
+    write_diagnostics = TRUE,
+    stop_on_error = FALSE
+) {
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Package `data.table` is required.", call. = FALSE)
+  }
+  lookup_table <- data.table::as.data.table(data.table::copy(lookup))
+  required_lookup_columns <- c("index", "site_lat")
+  missing_lookup_columns <- setdiff(
+    required_lookup_columns,
+    names(lookup_table)
+  )
+  if (length(missing_lookup_columns) > 0L) {
+    stop(
+      "`lookup` is missing: ",
+      paste(missing_lookup_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  lookup_table[, index := suppressWarnings(as.integer(index))]
+  lookup_table[, site_lat := suppressWarnings(as.numeric(site_lat))]
+  if (anyNA(lookup_table$index) || any(!is.finite(lookup_table$site_lat))) {
+    stop("`lookup$index` and `lookup$site_lat` must be valid.", call. = FALSE)
+  }
+  duplicate_indices <- lookup_table[, .N, by = index][N != 1L]
+  if (nrow(duplicate_indices) > 0L) {
+    stop("`lookup` must contain exactly one row per index.", call. = FALSE)
+  }
+  
+  members <- unique(suppressWarnings(as.integer(members)))
+  members <- members[is.finite(members) & members > 0L]
+  if (length(members) == 0L) {
+    stop("`members` must contain positive integers.", call. = FALSE)
+  }
+  workers <- suppressWarnings(as.integer(workers)[1L])
+  if (!is.finite(workers) || workers < 1L) {
+    stop("`workers` must be a positive integer.", call. = FALSE)
+  }
+  
+  jobs <- data.table::CJ(
+    index = lookup_table$index,
+    member = members,
+    unique = TRUE
+  )
+  dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+  
+  run_one_job <- function(job_number) {
+    job <- jobs[job_number]
+    site_row <- lookup_table[index == job$index]
+    latitude <- site_row$site_lat[1L]
+    soil_temperature_model <- if (
+      latitude > permafrost_latitude_threshold
+    ) {
+      "permafrost"
+    } else {
+      "non_permafrost"
+    }
+    parameter_table <- if (soil_temperature_model == "permafrost") {
+      permafrost_parameters
+    } else {
+      non_permafrost_parameters
+    }
+    
+    input_directory <- file.path(
+      input_root,
+      sprintf("ERA5_%d_%d", job$index, job$member)
+    )
+    input_clim_file <- file.path(
+      input_directory,
+      sprintf(
+        "ERA5.%d.%s.%s.clim",
+        job$member,
+        input_clim_start_date,
+        input_clim_end_date
+      )
+    )
+    output_directory <- file.path(
+      output_root,
+      sprintf("ERA5_%d_%d", job$index, job$member)
+    )
+    output_clim_file <- file.path(
+      output_directory,
+      sprintf(
+        "ERA5.%d.%s.%s.clim",
+        job$member,
+        format(as.Date(start_date), "%Y-%m-%d"),
+        format(as.Date(end_date), "%Y-%m-%d")
+      )
+    )
+    
+    tryCatch(
+      {
+        site_parameters <- .select_site_tau_parameters(
+          parameter_table = parameter_table,
+          index = job$index,
+          vertical_position = vertical_position,
+          soil_temperature_model = soil_temperature_model,
+          default_a_C = permafrost_a_C,
+          default_n_warm = permafrost_n_warm,
+          default_n_cold = permafrost_n_cold
+        )
+        result <- generate_neon_tau_gapfilled_clim(
+          input_clim_file = input_clim_file,
+          output_clim_file = output_clim_file,
+          index = job$index,
+          multi_site = multi_site,
+          site_parameters = site_parameters,
+          vertical_position = vertical_position,
+          start_date = start_date,
+          end_date = end_date,
+          soil_temperature_model = soil_temperature_model,
+          warmup_days = warmup_days,
+          observation_match_tolerance_seconds =
+            observation_match_tolerance_seconds,
+          clamp_soil_vpd = TRUE,
+          overwrite = overwrite,
+          write_diagnostics = write_diagnostics
+        )
+        result$member <- job$member
+        result$NEON_code <- if ("NEON_code" %in% names(site_row)) {
+          as.character(site_row$NEON_code[1L])
+        } else {
+          NA_character_
+        }
+        result$site_lat <- latitude
+        result$input_clim_file <- input_clim_file
+        result
+      },
+      error = function(error) {
+        data.frame(
+          index = job$index,
+          vertical_position = as.character(vertical_position),
+          soil_temperature_model = soil_temperature_model,
+          tau_days = NA_real_,
+          n_output_timesteps = NA_integer_,
+          n_neon_observed = NA_integer_,
+          n_tau_gapfilled = NA_integer_,
+          output_clim_file = output_clim_file,
+          diagnostics_file = NA_character_,
+          status = "ERROR",
+          member = job$member,
+          NEON_code = if ("NEON_code" %in% names(site_row)) {
+            as.character(site_row$NEON_code[1L])
+          } else {
+            NA_character_
+          },
+          site_lat = latitude,
+          input_clim_file = input_clim_file,
+          error_message = conditionMessage(error),
+          stringsAsFactors = FALSE
+        )
+      }
+    )
+  }
+  
+  job_numbers <- seq_len(nrow(jobs))
+  if (workers == 1L) {
+    results <- lapply(job_numbers, run_one_job)
+  } else {
+    if (!requireNamespace("future", quietly = TRUE) ||
+        !requireNamespace("future.apply", quietly = TRUE)) {
+      stop(
+        "Packages `future` and `future.apply` are required when workers > 1.",
+        call. = FALSE
+      )
+    }
+    future::plan(
+      future::multisession,
+      workers = min(workers, length(job_numbers))
+    )
+    on.exit(future::plan(future::sequential), add = TRUE)
+    results <- future.apply::future_lapply(
+      job_numbers,
+      run_one_job,
+      future.seed = TRUE
+    )
+  }
+  
+  manifest <- data.table::rbindlist(results, use.names = TRUE, fill = TRUE)
+  data.table::setorder(manifest, index, member)
+  manifest_file <- file.path(
+    output_root,
+    sprintf(
+      "neon_tau_gapfilled_VER%s_manifest.csv",
+      as.character(vertical_position)
+    )
+  )
+  data.table::fwrite(manifest, manifest_file)
+  
+  failed <- manifest$status == "ERROR"
+  if (isTRUE(stop_on_error) && any(failed)) {
+    stop(
+      sum(failed),
+      " climate job(s) failed. See ",
+      manifest_file,
+      ".",
+      call. = FALSE
+    )
+  }
+  
+  invisible(manifest)
 }
