@@ -1,5 +1,6 @@
 # =============================================================================
 # Standalone unified NEON soil-temperature MLE + LOYO workflow
+# Version: 2026-08-25.3 (data.table logical-filter hotfix)
 #
 # Canonical workflow for both non-permafrost and permafrost NEON sites.
 # Source only this file for SoilT MLE; it contains every required scientific
@@ -3451,11 +3452,14 @@ neon_tsoil_mle <- function(
     )
   }
 
-  # Use explicit logical comparisons for compatibility with recent
-  # data.table versions, which no longer treat DT[logical_column] as an
-  # unambiguous column expression when it is the sole i argument.
-  non_permafrost_lookup <- lookup_dt[is_permafrost == FALSE]
-  permafrost_lookup <- lookup_dt[is_permafrost == TRUE]
+  # Use `$` explicitly so the logical vector is resolved from lookup_dt rather
+  # than searched for in the calling scope by recent data.table versions.
+  non_permafrost_lookup <- lookup_dt[
+    lookup_dt$is_permafrost == FALSE
+  ]
+  permafrost_lookup <- lookup_dt[
+    lookup_dt$is_permafrost == TRUE
+  ]
 
   message(
     "NEON SoilT MLE classification: ",
