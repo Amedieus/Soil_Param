@@ -3451,8 +3451,11 @@ neon_tsoil_mle <- function(
     )
   }
 
-  non_permafrost_lookup <- lookup_dt[!is_permafrost]
-  permafrost_lookup <- lookup_dt[is_permafrost]
+  # Use explicit logical comparisons for compatibility with recent
+  # data.table versions, which no longer treat DT[logical_column] as an
+  # unambiguous column expression when it is the sole i argument.
+  non_permafrost_lookup <- lookup_dt[is_permafrost == FALSE]
+  permafrost_lookup <- lookup_dt[is_permafrost == TRUE]
 
   message(
     "NEON SoilT MLE classification: ",
