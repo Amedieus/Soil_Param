@@ -9,6 +9,7 @@
 #   * perfect predictions return R2 = 1 / RMSE = 0 instead of invalid metrics;
 #   * LOYO coverage is computed after ERA5 timestamp matching and warm-up;
 #   * at least two valid held-out folds are required;
+#   * fold-to-fold tau mean, SD, CV, and range quantify parameter stability;
 #   * final all-year MLE is retained even when LOYO cannot be completed;
 #   * failed joint optimizations are rejected;
 #   * the caller's future plan is restored after parallel execution.
@@ -2618,6 +2619,43 @@ fit_permafrost_all_sites <- function(
         correlation = NA_real_
       )
     }
+
+    fold_tau_values <- if (loyo_success) {
+      as.numeric(
+        getElement(
+          getElement(loyo, "fold_parameters"),
+          "tau_days"
+        )
+      )
+    } else {
+      numeric()
+    }
+
+    fold_tau_values <- fold_tau_values[
+      is.finite(fold_tau_values)
+    ]
+
+    fold_tau_mean <- if (length(fold_tau_values) > 0L) {
+      mean(fold_tau_values)
+    } else {
+      NA_real_
+    }
+
+    fold_tau_sd <- if (length(fold_tau_values) > 1L) {
+      stats::sd(fold_tau_values)
+    } else {
+      NA_real_
+    }
+
+    fold_tau_cv <- if (
+      is.finite(fold_tau_mean) &&
+      fold_tau_mean != 0 &&
+      is.finite(fold_tau_sd)
+    ) {
+      fold_tau_sd / abs(fold_tau_mean)
+    } else {
+      NA_real_
+    }
     
     summary <- data.table::data.table(
       index = site_index,
@@ -2646,6 +2684,24 @@ fit_permafrost_all_sites <- function(
       LOYO_message = loyo_message,
       LOYO_n = getElement(pooled_metrics, "n")[1L],
       LOYO_n_folds = getElement(pooled_metrics, "n_folds")[1L],
+      LOYO_tau_mean_days = fold_tau_mean,
+      LOYO_tau_SD_days = fold_tau_sd,
+      LOYO_tau_CV = fold_tau_cv,
+      LOYO_tau_min_days = if (length(fold_tau_values) > 0L) {
+        min(fold_tau_values)
+      } else {
+        NA_real_
+      },
+      LOYO_tau_max_days = if (length(fold_tau_values) > 0L) {
+        max(fold_tau_values)
+      } else {
+        NA_real_
+      },
+      LOYO_tau_range_days = if (length(fold_tau_values) > 0L) {
+        diff(range(fold_tau_values))
+      } else {
+        NA_real_
+      },
       LOYO_R2 = getElement(pooled_metrics, "r2")[1L],
       LOYO_RMSE_C = getElement(pooled_metrics, "rmse_C")[1L],
       LOYO_MAE_C = getElement(pooled_metrics, "mae_C")[1L],
