@@ -68,14 +68,14 @@ permafrost_tau_results <- fit_permafrost_all_sites(
 )
 
 ### SM validation
-soilmoisture_compare <- prepare_soilmoisture_validation_table(
-  lookup = lookup,
-  multi_site = multi_site,
-  era5_all = era5_all,
-  start_date = "2017-01-01",
-  end_date = "2024-12-31",
-  sipnet_out_dir =
-    "/projectnb/dietzelab/guYANG/pecan/updated_clim/out",
-  output_file =
-    "/projectnb/dietzelab/guYANG/soilparam/SoilMoisture_validation/NEON_SIPNET_SoilMoisture_3hour.csv"
-)
+# soilmoisture_compare <- prepare_soilmoisture_validation_table(
+#   lookup = lookup,
+#   multi_site = multi_site,
+#   era5_all = era5_all,
+#   start_date = "2017-01-01",
+#   end_date = "2024-12-31",
+#   sipnet_out_dir =
+#     "/projectnb/dietzelab/guYANG/pecan/updated_clim/out",
+#   output_file =
+#     "/projectnb/dietzelab/guYANG/soilparam/SoilMoisture_validation/NEON_SIPNET_SoilMoisture_3hour.csv"
+# )
